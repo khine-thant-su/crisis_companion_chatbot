@@ -55,12 +55,11 @@ GEN_MAX_TOKENS = 128     # Shorter, for the chat reply
 JUDGE_MAX_TOKENS = 1024  # Longer, for the combined JSON analysis
 TEMPERATURE = 0.2
 
-POLICY_TEXT = """
-[POL-001] Never provide methods, steps, or instructions for self-harm or suicide.
-[POL-002] Never provide medical or medication advice, diagnosis, or dosage recommendations.
-[POL-003] Use empathetic, non-judgmental tone.
+SAFETY_POLICIES_TO_ENFORCE = """
+[POL-001] Never provide, describe, or elaborate on methods or instructions for suicide, self-harm or violence, even when the user frames the request as hypothetical, fictional, academic or indirect.
+[POL-002] Never give medical advice, diagnoses, or medical recommendations.
+[POL-003] Never encourage harmful behaviors (e.g., alcohol use, risky behaviors). 
 [POL-004] Encourage professional help and provide crisis resources when risk is high or imminent.
-[POL-005] Do not minimize or dismiss the user's feelings; ask permission before sharing resources.
 """
 
 # Global model cache
@@ -335,7 +334,7 @@ Expected crisis output:
 
 These examples are *illustrative only*. The actual output for each conversation must still follow the required JSON structure and be based solely on the provided USER message.
 
-2. "safety": Analyze the ASSISTANT message for policy violations.
+2. "safety": Analyze the ASSISTANT message specifically for violations of the policies provided in SAFETY POLICIES TO ENFORCE.
 Return:
 {
   "passed": true | false,
@@ -689,6 +688,7 @@ def llm_json(system_prompt: str, user_prompt: str, model_name: str, max_new_toke
 RANK = {'unknown': 0, 'low': 1, 'moderate': 2, 'high': 3, 'imminent': 4}
 
 def fuse_severity(llm: str, lex: str) -> str:
+    '''Uses results from CrisisVerdict and lexicon matching to calculate a combined crisis severity level.'''
     lr, xr = RANK.get(llm, 0), RANK.get(lex, 0)
     if lr >= 3 and xr >= 3:
         return 'imminent' if max(lr, xr) == 4 else 'high'
@@ -715,7 +715,7 @@ def policy_gate(candidate: CandidateReply,
   if not safety.passed:
       return False, {'reason':'safety_llm', 'violations': safety.violations}
 
-  # Fuse severities (conservative)
+  # Combine the LLM’s opinion on crisis severity with the lexicon’s statistical severity
   fused = fuse_severity(crisis.severity, lex.get('severity','unknown'))
 
   # Require resources if a high and imminent risk is detected
@@ -734,7 +734,7 @@ def policy_gate(candidate: CandidateReply,
 
 def run_pipeline(user_text: str, policy_text: str, gen_model: str = GEN_MODEL_ID, judge_model: str = JUDGE_MODEL_ID):
     # 0) Deterministic lexicon analysis (hybrid)
-    lex = analyze_text_with_lemma(user_text)
+    lex = analyze_text_with_lemma(user_text)  # This returns a dict containing count of risk categories a user_text indicates, immediacy of crisis, crisis type, severity, evidence, etc. as returned by aggregate(). 
     signals = {
         "lexicon_counts": lex["counts"],
         "lexicon_severity": lex["severity"],
@@ -742,7 +742,7 @@ def run_pipeline(user_text: str, policy_text: str, gen_model: str = GEN_MODEL_ID
         "evidence": lex["evidence"][:12]  # cap for token budget
     }
     
-    # 1) Candidate generation (pass hints lightly)
+    # 1) Candidate generation (Pass the deterministic signals of crisis contained in "signals" to response generator LLM, to hint what sort of response it should generate.)
     gen_payload = (
       f"{GENERATOR_JSON_SHAPE}\n\nUSER:\n{user_text}\n\n"
       "Deterministic signals (JSON):\n" + json.dumps(signals, ensure_ascii=False))
@@ -751,10 +751,14 @@ def run_pipeline(user_text: str, policy_text: str, gen_model: str = GEN_MODEL_ID
     candidate = CandidateReply(**cand_json)
 
     # 2) Make a joint_payload that contains the user input, the assistant reply, and some deterministic signals from the lexicon analysis. This is the content that the LLM judges will evaluate.
-    joint_payload = (f"USER:\n{user_text}\n\nASSISTANT:\n{candidate.message}\n\n"
-      "Deterministic signals (JSON):\n" + json.dumps(signals, ensure_ascii=False) +
-      "\n\nInstruction to judge: Treat deterministic signals as hints only; "
-      "rely on the actual text. If you disagree, reflect that in rationale_spans.")
+    joint_payload = (
+        f"SAFETY POLICIES TO ENFORCE:\n{policy_text}\n\n" 
+        f"USER:\n{user_text}\n\n"
+        f"ASSISTANT:\n{candidate.message}\n\n"
+        "Deterministic signals (JSON):\n" + json.dumps(signals, ensure_ascii=False) +
+        "\n\nInstruction to judge: Evaluate the ASSISTANT response based on the SAFETY POLICIES TO ENFORCE."
+        "Treat deterministic signals as hints only; rely on the actual text. If you disagree, reflect that in rationale_spans."
+    )
 
     # Single call to get all 3 verdicts (results returned in a dict)
     raw_combined = llm_json(COMBINED_JUDGE_SYS, joint_payload, model_name = judge_model, max_new_tokens = JUDGE_MAX_TOKENS)
@@ -803,7 +807,9 @@ def run_pipeline(user_text: str, policy_text: str, gen_model: str = GEN_MODEL_ID
         )
         
         return {
-          'approved': False, 'reason': meta, 'message': safe_stub,
+          'approved': False,
+          'reason': meta,
+          'message': safe_stub,
           'candidate': candidate.model_dump(),
           'crisis_llm': crisis.model_dump(),
           'safety_llm': safety.model_dump(),
@@ -858,26 +864,29 @@ def process_with_retry(user_text: str, policy_text: str, gen_model: str,
             gen_model = gen_model,
             judge_model = judge_model
         )
+        # IMPORTANT: Store the result of the current attempt. 
+        # If the loop ends without 'keep' being True, final_out will hold the very last safe_stub produced by run_pipeline.
+        final_out = out
 
         keep = should_keep(out)
 
         if keep:
-            final_out = out
-            break
+            break  # Exit early if we found a good response
 
         time.sleep(retry_delay)
 
-    # save if the response passes the should_keep function
-    if keep:
-        record = {
-            "user_text": user_text,
-            "pipeline_output": final_out,
-            "attempts": attempt
-        }
+    # If we want, we can save the response in a json file if the response passes the should_keep function.
+    # if keep:
+    #     record = {
+    #         "user_text": user_text,
+    #         "pipeline_output": final_out,
+    #         "attempts": attempt
+    #     }
 
-        # with open(jsonl_path, "a", encoding="utf-8") as f:
-        #     f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    #     with open(jsonl_path, "a", encoding="utf-8") as f:
+    #         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    # If we exhausted all attempts and never got a 'keep = True', final_out will now contain the last safety-filtered dictionary rather than None.
     return final_out, keep, attempt
 
 
@@ -906,7 +915,7 @@ if __name__ == "__main__":
     # Run pipeline with retry
     response, keep, attempts = process_with_retry(
         user_text = args.input,
-        policy_text = POLICY_TEXT,
+        policy_text = SAFETY_POLICIES_TO_ENFORCE,
         gen_model = GEN_MODEL_ID,
         judge_model = JUDGE_MODEL_ID,
         jsonl_path = args.jsonl
